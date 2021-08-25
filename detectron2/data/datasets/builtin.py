@@ -41,8 +41,10 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
         "coco/val2014",
         "coco/annotations/instances_valminusminival2014.json",
     ),
-    "coco_2017_train": ("coco/train2017", "coco/annotations/instances_train2017.json"),
-    "coco_2017_val": ("coco/val2017", "coco/annotations/instances_val2017.json"),
+    # "coco_2017_train": ("coco/train2017", "coco/annotations/instances_train2017.json"),
+    "coco_2017_train": ("022719/train2017", "022719/annotations/instances_train2017.json"),
+    # "coco_2017_val": ("coco/val2017", "coco/annotations/instances_val2017.json"),
+    "coco_2017_val": ("022719/val2017", "022719/annotations/instances_val2017.json"),
     "coco_2017_test": ("coco/test2017", "coco/annotations/image_info_test2017.json"),
     "coco_2017_test-dev": ("coco/test2017", "coco/annotations/image_info_test-dev2017.json"),
     "coco_2017_val_100": ("coco/val2017", "coco/annotations/instances_val2017_100.json"),
@@ -255,7 +257,8 @@ def register_all_ade20k(root):
 # Internally at fb, we register them elsewhere
 if __name__.endswith(".builtin"):
     # Assume pre-defined datasets live in `./datasets`.
-    _root = os.getenv("DETECTRON2_DATASETS", "datasets")
+    # _root = os.getenv("DETECTRON2_DATASETS", "datasets")
+    _root = os.getenv("DETECTRON2_DATASETS", "/datasets01/COCO/")
     register_all_coco(_root)
     register_all_lvis(_root)
     register_all_cityscapes(_root)
