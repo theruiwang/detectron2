@@ -159,10 +159,10 @@ def fast_rcnn_inference_single_image(
     scores = scores[filter_mask]
 
     # 2. Apply NMS for each class independently.
-    keep = batched_nms(boxes, scores, filter_inds[:, 1], nms_thresh)
-    if topk_per_image >= 0:
-        keep = keep[:topk_per_image]
-    boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
+    # keep = batched_nms(boxes, scores, filter_inds[:, 1], nms_thresh)
+    # if topk_per_image >= 0:
+    #     keep = keep[:topk_per_image]
+    # boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
 
     result = Instances(image_shape)
     result.pred_boxes = Boxes(boxes)
@@ -375,8 +375,13 @@ class FastRCNNOutputLayers(nn.Module):
         self.num_classes = num_classes
         input_size = input_shape.channels * (input_shape.width or 1) * (input_shape.height or 1)
         # prediction layer for num_classes foreground classes and one background class (hence + 1)
-        self.cls_score = nn.Linear(input_size, num_classes + 1)
-        num_bbox_reg_classes = 1 if cls_agnostic_bbox_reg else num_classes
+        # begin change
+        # class-agnostic cls and box reg
+        #self.cls_score = nn.Linear(input_size, num_classes + 1)
+        self.cls_score = nn.Linear(input_size, 1 + 1)
+        num_bbox_reg_classes = 1
+        # num_bbox_reg_classes = 1 if cls_agnostic_bbox_reg else num_classes
+        # end change
         box_dim = len(box2box_transform.weights)
         self.bbox_pred = nn.Linear(input_size, num_bbox_reg_classes * box_dim)
 
@@ -402,6 +407,7 @@ class FastRCNNOutputLayers(nn.Module):
             "box2box_transform": Box2BoxTransform(weights=cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS),
             # fmt: off
             "num_classes"           : cfg.MODEL.ROI_HEADS.NUM_CLASSES,
+            # "num_classes"           : 1,
             "cls_agnostic_bbox_reg" : cfg.MODEL.ROI_BOX_HEAD.CLS_AGNOSTIC_BBOX_REG,
             "smooth_l1_beta"        : cfg.MODEL.ROI_BOX_HEAD.SMOOTH_L1_BETA,
             "test_score_thresh"     : cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST,
@@ -448,6 +454,16 @@ class FastRCNNOutputLayers(nn.Module):
         gt_classes = (
             cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0)
         )
+
+        # begin change
+        fg_inds = (gt_classes < self.num_classes) # 0~79
+        bg_inds = (gt_classes == self.num_classes) # = 80
+        gt_classes[fg_inds] = 0
+        gt_classes[bg_inds] = 1
+        #print(gt_classes, gt_classes.shape, gt_classes.min(), gt_classes.max())
+        #assert 1 == 0
+        # end change
+
         _log_classification_stats(scores, gt_classes)
 
         # parse box regression outputs
@@ -482,7 +498,10 @@ class FastRCNNOutputLayers(nn.Module):
         """
         box_dim = proposal_boxes.shape[1]  # 4 or 5
         # Regression loss is only computed for foreground proposals (those matched to a GT)
-        fg_inds = nonzero_tuple((gt_classes >= 0) & (gt_classes < self.num_classes))[0]
+        # begin change
+        #fg_inds = nonzero_tuple((gt_classes >= 0) & (gt_classes < self.num_classes))[0]
+        fg_inds = nonzero_tuple(gt_classes == 0)[0]
+        # end change
         if pred_deltas.shape[1] == box_dim:  # cls-agnostic regression
             fg_pred_deltas = pred_deltas[fg_inds]
         else:
@@ -617,6 +636,231 @@ class FastRCNNOutputLayers(nn.Module):
                 Element i has shape (Ri, K + 1), where Ri is the number of proposals for image i.
         """
         scores, _ = predictions
+        num_inst_per_image = [len(p) for p in proposals]
+        probs = F.softmax(scores, dim=-1)
+        return probs.split(num_inst_per_image, dim=0)
+
+
+
+class FastRCNNOutputLayers_cls(nn.Module):
+    """
+    Two linear layers for predicting Fast R-CNN outputs:
+
+    1. proposal-to-detection box regression deltas
+    2. classification scores
+    """
+
+    @configurable
+    def __init__(
+        self,
+        input_shape: ShapeSpec,
+        *,
+        num_classes: int,
+        test_score_thresh: float = 0.0,
+        test_nms_thresh: float = 0.5,
+        test_topk_per_image: int = 100,
+    ):
+        """
+        NOTE: this interface is experimental.
+
+        Args:
+            input_shape (ShapeSpec): shape of the input feature to this module
+            box2box_transform (Box2BoxTransform or Box2BoxTransformRotated):
+            num_classes (int): number of foreground classes
+            test_score_thresh (float): threshold to filter predictions results.
+            test_nms_thresh (float): NMS threshold for prediction results.
+            test_topk_per_image (int): number of top predictions to produce per image.
+            cls_agnostic_bbox_reg (bool): whether to use class agnostic for bbox regression
+            smooth_l1_beta (float): transition point from L1 to L2 loss. Only used if
+                `box_reg_loss_type` is "smooth_l1"
+            box_reg_loss_type (str): Box regression loss type. One of: "smooth_l1", "giou"
+            loss_weight (float|dict): weights to use for losses. Can be single float for weighting
+                all losses, or a dict of individual weightings. Valid dict keys are:
+                    * "loss_cls": applied to classification loss
+                    * "loss_box_reg": applied to box regression loss
+        """
+        super().__init__()
+        if isinstance(input_shape, int):  # some backward compatibility
+            input_shape = ShapeSpec(channels=input_shape)
+        self.num_classes = num_classes
+        input_size = input_shape.channels * (input_shape.width or 1) * (input_shape.height or 1)
+        # prediction layer for num_classes foreground classes and one background class (hence + 1)
+
+        self.cls_score = nn.Linear(input_size, num_classes + 1)
+
+        nn.init.normal_(self.cls_score.weight, std=0.01)
+
+        self.test_score_thresh = test_score_thresh
+        self.test_nms_thresh = test_nms_thresh
+        self.test_topk_per_image = test_topk_per_image
+ 
+    @classmethod
+    def from_config(cls, cfg, input_shape):
+        return {
+            "input_shape": input_shape,
+            # fmt: off
+            "num_classes"           : cfg.MODEL.ROI_HEADS.NUM_CLASSES,
+            "test_score_thresh"     : cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST,
+            "test_nms_thresh"       : cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST,
+            "test_topk_per_image"   : cfg.TEST.DETECTIONS_PER_IMAGE,
+            # fmt: on
+        }
+
+    def forward(self, x):
+        """
+        Args:
+            x: per-region features of shape (N, ...) for N bounding boxes to predict.
+
+        Returns:
+            (Tensor, Tensor):
+            First tensor: shape (N,K+1), scores for each of the N box. Each row contains the
+            scores for K object categories and 1 background class.
+
+            Second tensor: bounding box regression deltas for each box. Shape is shape (N,Kx4),
+            or (N,4) for class-agnostic regression.
+        """
+        if x.dim() > 2:
+            x = torch.flatten(x, start_dim=1)
+        scores = self.cls_score(x)
+        return scores
+
+    def losses(self, predictions, proposals):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were used
+                to compute predictions. The fields ``proposal_boxes``, ``gt_boxes``,
+                ``gt_classes`` are expected.
+
+        Returns:
+            Dict[str, Tensor]: dict of losses
+        """
+        scores = predictions
+
+        # parse classification outputs
+        gt_classes = (
+            cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0)
+        )
+
+        _log_classification_stats(scores, gt_classes)
+
+        losses = {
+            "loss_cls_final": cross_entropy(scores, gt_classes, reduction="mean"),
+        }
+        return losses
+
+
+    def inference(self, predictions: torch.Tensor, proposals: List[Instances]):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were
+                used to compute predictions. The ``proposal_boxes`` field is expected.
+
+        Returns:
+            list[Instances]: same as `fast_rcnn_inference`.
+            list[Tensor]: same as `fast_rcnn_inference`.
+        """
+        def _postprocessing(predictions, proposals):
+            assert len(proposals) == 1
+            scores = self.predict_probs(predictions, proposals)[0]
+            pred_boxes = proposals[0].pred_boxes
+            # print(self.test_score_thresh)
+            # print(self.test_nms_thresh)
+            # print(self.test_topk_per_image)
+            # print(f"at begining: {len(pred_boxes)}")
+            #assert 0 == 1
+
+            # re-assign scores to boxes
+            pred_classes = scores.argmax(dim=1)
+            scores = scores.gather(1, pred_classes.view(-1,1)).flatten()
+
+            # remove background boxes
+            inds = pred_classes < self.num_classes
+            scores = scores[inds]
+            pred_classes = pred_classes[inds]
+            pred_boxes = pred_boxes[inds]
+            #print(f"after removing background: {len(pred_boxes)}")
+
+            # filtering out low-confidence boxes
+            inds = scores > self.test_score_thresh
+            scores = scores[inds]
+            pred_boxes = pred_boxes[inds]
+            pred_classes = pred_classes[inds]
+            #print(f"after filtering low-confidence: {len(pred_boxes)}")
+
+            # re-sort instances based on new scores
+            inds = scores.argsort(descending=True)
+            scores = scores[inds]
+            pred_classes = pred_classes[inds]
+            pred_boxes = pred_boxes[inds]
+
+            # NMS
+            from torchvision.ops import nms 
+            keep = nms(pred_boxes.tensor, scores, self.test_nms_thresh)
+            scores = scores[keep]
+            pred_classes = pred_classes[keep]
+            pred_boxes = pred_boxes[keep]
+            #print(f"after NMS: {len(pred_boxes)}")
+
+            # topk_per_image
+            inds = scores.argsort(descending=True)[:self.test_topk_per_image]
+            scores = scores[inds]
+            pred_classes = pred_classes[inds]
+            pred_boxes = pred_boxes[inds]
+            #print(f"after topk: {len(pred_boxes)}")
+            #assert 0 == 1
+
+            # prepare return values
+            results = Instances(proposals[0]._image_size)
+            results.scores = scores
+            results.pred_classes = pred_classes
+            results.pred_boxes = pred_boxes
+            return [results], None
+        #return _postprocessing(predictions, proposals)
+
+        def _postprocessing_class_specific(predictions, proposals):
+            assert len(proposals) == 1
+            scores = self.predict_probs(predictions, proposals)[0]
+            pred_boxes = proposals[0].pred_boxes.tensor.view(-1, 1, 4)
+            pred_boxes = pred_boxes.repeat(1, self.num_classes, 1)
+
+            #class-specific postprocessing
+            scores = scores[:, :-1]
+            filter_mask = scores > self.test_score_thresh  # R x K
+            filter_inds = filter_mask.nonzero()
+            pred_boxes = pred_boxes[filter_mask]
+            scores = scores[filter_mask]
+
+            keep = batched_nms(pred_boxes, scores, filter_inds[:, 1], self.test_nms_thresh)
+            if self.test_topk_per_image >= 0:
+                keep = keep[:self.test_topk_per_image]
+            pred_boxes, scores, filter_inds = pred_boxes[keep], scores[keep], filter_inds[keep]
+            
+            result = Instances(proposals[0]._image_size)
+            result.pred_boxes = Boxes(pred_boxes)
+            result.scores = scores
+            result.pred_classes = filter_inds[:, 1]
+            return [result], [filter_inds[:, 0]]
+
+        return _postprocessing_class_specific(predictions, proposals)
+
+
+    def predict_probs(
+        self, predictions: Tuple[torch.Tensor, torch.Tensor], proposals: List[Instances]
+    ):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were
+                used to compute predictions.
+
+        Returns:
+            list[Tensor]:
+                A list of Tensors of predicted class probabilities for each image.
+                Element i has shape (Ri, K + 1), where Ri is the number of proposals for image i.
+        """
+        scores = predictions
         num_inst_per_image = [len(p) for p in proposals]
         probs = F.softmax(scores, dim=-1)
         return probs.split(num_inst_per_image, dim=0)

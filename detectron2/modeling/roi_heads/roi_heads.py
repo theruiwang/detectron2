@@ -18,7 +18,7 @@ from ..poolers import ROIPooler
 from ..proposal_generator.proposal_utils import add_ground_truth_to_proposals
 from ..sampling import subsample_labels
 from .box_head import build_box_head
-from .fast_rcnn import FastRCNNOutputLayers
+from .fast_rcnn import FastRCNNOutputLayers, FastRCNNOutputLayers_cls
 from .keypoint_head import build_keypoint_head
 from .mask_head import build_mask_head
 
@@ -553,6 +553,10 @@ class StandardROIHeads(ROIHeads):
         keypoint_in_features: Optional[List[str]] = None,
         keypoint_pooler: Optional[ROIPooler] = None,
         keypoint_head: Optional[nn.Module] = None,
+        cls_in_features: Optional[List[str]] = None,
+        cls_pooler: Optional[ROIPooler] = None,
+        cls_head: Optional[nn.Module] = None,
+        cls_predictor: Optional[nn.Module] = None,
         train_on_pred_boxes: bool = False,
         **kwargs,
     ):
@@ -595,6 +599,12 @@ class StandardROIHeads(ROIHeads):
             self.keypoint_pooler = keypoint_pooler
             self.keypoint_head = keypoint_head
 
+        # cls head
+        self.cls_in_features = cls_in_features
+        self.cls_pooler = cls_pooler
+        self.cls_head = cls_head
+        self.cls_predictor = cls_predictor
+
         self.train_on_pred_boxes = train_on_pred_boxes
 
     @classmethod
@@ -612,6 +622,8 @@ class StandardROIHeads(ROIHeads):
             ret.update(cls._init_mask_head(cfg, input_shape))
         if inspect.ismethod(cls._init_keypoint_head):
             ret.update(cls._init_keypoint_head(cfg, input_shape))
+        if inspect.ismethod(cls._init_cls_head):
+            ret.update(cls._init_cls_head(cfg, input_shape))
         return ret
 
     @classmethod
@@ -650,6 +662,38 @@ class StandardROIHeads(ROIHeads):
             "box_head": box_head,
             "box_predictor": box_predictor,
         }
+
+    @classmethod
+    def _init_cls_head(cls, cfg, input_shape):
+        # fmt: off
+        in_features       = cfg.MODEL.ROI_HEADS.IN_FEATURES
+        pooler_resolution = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        pooler_scales     = tuple(1.0 / input_shape[k].stride for k in in_features)
+        sampling_ratio    = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
+        pooler_type       = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
+        # fmt: on
+
+        in_channels = [input_shape[f].channels for f in in_features][0]
+
+        cls_pooler = ROIPooler(
+            output_size=pooler_resolution,
+            scales=pooler_scales,
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type,
+        )
+
+        cls_head = build_box_head(
+            cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
+        )
+        cls_predictor = FastRCNNOutputLayers_cls(cfg, cls_head.output_shape)
+
+        return {
+            "cls_in_features": in_features,
+            "cls_pooler": cls_pooler,
+            "cls_head": cls_head,
+            "cls_predictor": cls_predictor,
+        }
+        
 
     @classmethod
     def _init_mask_head(cls, cfg, input_shape):
@@ -742,6 +786,7 @@ class StandardROIHeads(ROIHeads):
             # predicted by the box head.
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
+            losses.update(self._forward_cls(features, proposals))
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
@@ -775,6 +820,7 @@ class StandardROIHeads(ROIHeads):
 
         instances = self._forward_mask(features, instances)
         instances = self._forward_keypoint(features, instances)
+        instances = self._forward_cls(features, instances)
         return instances
 
     def _forward_box(self, features: Dict[str, torch.Tensor], proposals: List[Instances]):
@@ -815,6 +861,38 @@ class StandardROIHeads(ROIHeads):
             pred_instances, _ = self.box_predictor.inference(predictions, proposals)
             return pred_instances
 
+    def _forward_cls(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+        """
+        Forward logic of the box prediction branch. If `self.train_on_pred_boxes is True`,
+            the function puts predicted boxes in the `proposal_boxes` field of `proposals` argument.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            proposals (list[Instances]): the per-image object proposals with
+                their matching ground truth.
+                Each has fields "proposal_boxes", and "objectness_logits",
+                "gt_classes", "gt_boxes".
+
+        Returns:
+            In training, a dict of losses.
+            In inference, a list of `Instances`, the predicted instances.
+        """
+        features = [features[f] for f in self.cls_in_features]
+        cls_features = self.cls_pooler(features, [x.proposal_boxes if self.training else x.pred_boxes for x in instances])
+        cls_features = self.cls_head(cls_features)
+        predictions = self.cls_predictor(cls_features)
+        del cls_features
+
+        if self.training:
+            losses = self.cls_predictor.losses(predictions, instances)
+            # proposals is modified in-place below, so losses must be computed first.
+            return losses
+        else:
+
+            pred_instances, _ = self.cls_predictor.inference(predictions, instances)
+            return pred_instances
+    
     def _forward_mask(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
         """
         Forward logic of the mask prediction branch.

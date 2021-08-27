@@ -230,6 +230,13 @@ def get_detection_dataset_dicts(names, filter_empty=True, min_keypoints=0, propo
         names = [names]
     assert len(names), names
     dataset_dicts = [DatasetCatalog.get(dataset_name) for dataset_name in names]
+    #dataset_dicts = [[dataset_dicts[0][0]]]
+    #print(dataset_dicts)
+    # print(type(dataset_dicts))
+    # print(type(dataset_dicts[0]))
+    # print(type(dataset_dicts[0][0]))
+    # print(dataset_dicts[0][0])
+    # assert 0 == 1
     for dataset_name, dicts in zip(names, dataset_dicts):
         assert len(dicts), "Dataset '{}' is empty!".format(dataset_name)
 
